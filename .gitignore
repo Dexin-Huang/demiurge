@@ -1,0 +1,39 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+
+# Data & checkpoints
+*.h5
+*.hdf5
+*.ckpt
+*.pt
+*.pth
+checkpoints/
+data/
+
+# Logs
+wandb/
+lightning_logs/
+*.log
+
+# Env
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Experiment outputs
+experiments/ablations/*/results/
+experiments/ablations/*/checkpoints/

@@ -1,0 +1,3 @@
+[submodule "baselines/lewm"]
+	path = baselines/lewm
+	url = https://github.com/lucas-maes/le-wm

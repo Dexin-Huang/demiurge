@@ -1,0 +1,28 @@
+# Condition D: Frozen scaffold + modulation gates (no property memory)
+condition: frozen_plus_gates
+scaffold_type: frozen
+use_gating: true
+use_property_memory: false
+
+model:
+  lewm_embed_dim: 192
+  num_slots: 8
+  num_freq_bands: 8
+  context_dim: 128
+  pred_layers: 4
+  pred_heads: 4
+  dropout: 0.1
+
+training:
+  lr: 1e-4
+  slow_lr_factor: 0.1
+  weight_decay: 1e-3
+  epochs: 100
+  batch_size: 64
+
+loss:
+  lambda_gate: 0.01
+
+notes: >
+  Tests whether gating improves OOD transfer over bare frozen scaffold.
+  Monitor gate entropy — must not collapse.

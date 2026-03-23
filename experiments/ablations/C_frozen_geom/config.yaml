@@ -1,0 +1,24 @@
+# Condition C: LeWM + frozen geometric scaffold (Layer 1 only)
+condition: frozen_geom
+scaffold_type: frozen
+use_gating: false
+use_property_memory: false
+
+model:
+  lewm_embed_dim: 192
+  num_slots: 8
+  num_freq_bands: 8
+  context_dim: 128
+  pred_layers: 4
+  pred_heads: 4
+  dropout: 0.1
+
+training:
+  lr: 1e-4
+  weight_decay: 1e-3
+  epochs: 100
+  batch_size: 64
+
+notes: >
+  Core ablation question: does frozen scaffold (C) beat learnable (B)?
+  If B >> C, the frozen prior hypothesis is wrong.

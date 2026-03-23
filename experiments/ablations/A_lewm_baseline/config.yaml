@@ -1,0 +1,13 @@
+# Condition A: LeWM baseline — unstructured latent, no scaffold
+# Run LeWM as-is. Do not modify.
+condition: lewm_baseline
+scaffold_type: none
+use_gating: false
+use_property_memory: false
+
+# Use LeWM's native config for training
+lewm_config: baselines/lewm/config/train/lewm.yaml
+
+notes: >
+  This is the unmodified LeWM baseline (Condition A).
+  Clone the repo and run directly. No DEMIURGE components.
