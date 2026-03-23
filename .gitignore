@@ -20,8 +20,21 @@ wandb/
 lightning_logs/
 *.log
 
+# Secrets & credentials — NEVER track
+secrets/
+.secrets/
+*.pem
+*.key
+*.secret
+*.credential*
+*api_key*
+*apikey*
+*token*
+!model/tokenizer.py
+
 # Env
 .env
+.env.*
 .venv/
 venv/
 
