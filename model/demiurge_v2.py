@@ -75,26 +75,29 @@ class DemiurgeV2(nn.Module):
 
     def forward(
         self,
-        lewm_embeddings: Tensor,
+        patch_tokens: Tensor,
         future_embeddings: Tensor | None = None,
         gt_positions: Tensor | None = None,
         gt_velocities: Tensor | None = None,
+        object_features: Tensor | None = None,
         n_rollout_steps: int = 4,
     ) -> dict:
         """Full forward pass.
 
         Args:
-            lewm_embeddings: (B, D) frozen LeWM CLS embeddings for current frame
-            future_embeddings: (B, H, D) frozen LeWM embeddings for future frames
+            patch_tokens: (B, N, D) spatial patch tokens from frozen LeWM ViT
+                          (use encoder output[:, 1:] — exclude CLS token)
+            future_embeddings: (B, H, D) frozen LeWM CLS embeddings for future frames
             gt_positions: (B, K, 2) optional ground-truth positions
             gt_velocities: (B, K, 2) optional ground-truth velocities
+            object_features: (B, K, D) optional GT per-object features
             n_rollout_steps: number of steps to simulate forward
 
         Returns:
             dict with predictions, losses, state trajectory
         """
-        # 1. Estimate state from visual embedding
-        state = self.estimator(lewm_embeddings)
+        # 1. Estimate state from visual patch tokens
+        state = self.estimator(patch_tokens, object_features=object_features)
         q_v = state["q_v"]
         z = state["z"]
         sigma = state["sigma"]
@@ -141,12 +144,12 @@ class DemiurgeV2(nn.Module):
         # Material regularization
         losses["material_kl"] = self.simulator.material_belief.kl_loss(z, sigma)
 
-        # Energy monitoring (not a loss, just tracking)
-        with torch.no_grad():
-            energies = [
-                self.simulator.energy(trajectory["q"][t], trajectory["v"][t], trajectory["z"][t])
-                for t in range(len(trajectory["q"]))
-            ]
+        # Energy passivity constraint
+        energies = [
+            self.simulator.energy(trajectory["q"][t], trajectory["v"][t], trajectory["z"][t])
+            for t in range(len(trajectory["q"]))
+        ]
+        losses["passivity"] = self.simulator.passivity_loss(energies)
 
         return {
             "predicted_embeddings": predicted_embeddings,

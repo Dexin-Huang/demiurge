@@ -44,6 +44,12 @@ class MaterialBelief(nn.Module):
             nn.Linear(hidden_dim, material_dim * 2),  # δ_z and δ_σ
         )
 
+        # Learnable update dynamics (instead of magic numbers)
+        # sigma_shrink: how much uncertainty shrinks on update (sigmoid → [0,1])
+        self.sigma_shrink = nn.Parameter(torch.tensor(-2.0))  # init ~0.12
+        # sigma_growth: how much uncertainty grows per step without update
+        self.sigma_growth = nn.Parameter(torch.tensor(-6.0))  # init ~0.002
+
     def update(
         self,
         z: Tensor,
@@ -74,13 +80,19 @@ class MaterialBelief(nn.Module):
         delta = self.evidence_encoder(evidence_input)
         delta_z, delta_sigma = delta.chunk(2, dim=-1)
 
-        # Mask: only update where innovation exceeds threshold
-        update_mask = (innovation > threshold).float().unsqueeze(-1)  # (B, K, 1)
+        # Soft mask via sigmoid for gradient flow
+        update_mask = torch.sigmoid(
+            10.0 * (innovation - threshold)
+        ).unsqueeze(-1)  # (B, K, 1), smooth step around threshold
+
+        # Learnable update dynamics
+        shrink = torch.sigmoid(self.sigma_shrink)   # how much σ shrinks on update
+        growth = torch.sigmoid(self.sigma_growth)    # how much σ grows without update
 
         # Bayesian-ish update: reduce uncertainty, shift mean
-        z_new = z + update_mask * delta_z * sigma  # scale update by uncertainty
-        sigma_new = sigma * (1.0 - update_mask * 0.1)  # shrink uncertainty on update
-        sigma_new = sigma_new + (1 - update_mask) * 0.001  # tiny growth when no update (prevent collapse)
+        z_new = z + update_mask * delta_z * sigma    # scale update by uncertainty
+        sigma_new = sigma * (1.0 - update_mask * shrink)  # shrink on update
+        sigma_new = sigma_new + (1 - update_mask) * growth  # grow without update
         sigma_new = sigma_new.clamp(min=0.01)  # floor
 
         return z_new, sigma_new

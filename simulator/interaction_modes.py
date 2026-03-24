@@ -88,8 +88,8 @@ class ModeClassifier(nn.Module):
 
         logits = self.classifier(features)  # (B, K, K, num_modes)
 
-        # Hard mode assignment (straight-through for gradients)
-        modes = logits.argmax(dim=-1)  # (B, K, K)
+        # Hard modes for logging/monitoring only (not used in gradient path)
+        modes = logits.detach().argmax(dim=-1)  # (B, K, K)
 
         return modes, logits
 

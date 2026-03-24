@@ -61,13 +61,18 @@ class HybridBeliefSimulator(nn.Module):
             nn.Linear(force_hidden, state_dim),
         )
 
-        # Impulse model per interaction mode: J_m(Δq, Δv, z_i, z_j)
+        # Per-mode impulse heads: J_m(Δq, Δv, z_i, z_j)
+        # Each active mode has its own tiny force law
         impulse_input = state_dim * 2 + material_dim * 2  # Δq, Δv, z_i, z_j
-        self.impulse_model = nn.Sequential(
-            nn.Linear(impulse_input, force_hidden),
-            nn.GELU(),
-            nn.Linear(force_hidden, state_dim),
-        )
+        num_active_modes = InteractionMode.num_modes() - 1  # exclude NONE
+        self.impulse_heads = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(impulse_input, force_hidden),
+                nn.GELU(),
+                nn.Linear(force_hidden, state_dim),
+            )
+            for _ in range(num_active_modes)
+        ])
 
         # Mode classifier
         self.mode_classifier = ModeClassifier(
@@ -119,23 +124,31 @@ class HybridBeliefSimulator(nn.Module):
         # Add gravity
         a_free = a_free + self.gravity.unsqueeze(0).unsqueeze(0)
 
-        # 3. Compute interaction impulses (only for active modes)
-        impulses = torch.zeros_like(v)  # (B, K, D)
-        active = (modes != InteractionMode.NONE.value).float()  # (B, K, K)
+        # 3. Compute interaction impulses per mode
+        # Use Gumbel-softmax for differentiable mode selection
+        mode_weights = torch.nn.functional.gumbel_softmax(
+            mode_logits, tau=1.0, hard=False, dim=-1,
+        )  # (B, K, K, num_modes)
 
-        if active.any():
-            # Pairwise impulse inputs
-            z_i = z.unsqueeze(2).expand(B, K, K, -1)
-            z_j = z.unsqueeze(1).expand(B, K, K, -1)
-            imp_input = torch.cat([
-                pairwise["delta_q"], pairwise["delta_v"], z_i, z_j
-            ], dim=-1)  # (B, K, K, 2D+2M)
+        # Pairwise impulse inputs
+        z_i = z.unsqueeze(2).expand(B, K, K, -1)
+        z_j = z.unsqueeze(1).expand(B, K, K, -1)
+        imp_input = torch.cat([
+            pairwise["delta_q"], pairwise["delta_v"], z_i, z_j
+        ], dim=-1)  # (B, K, K, 2D+2M)
 
-            raw_impulse = self.impulse_model(imp_input)  # (B, K, K, D)
+        # Each mode head produces its impulse, weighted by soft mode selection
+        # Mode 0 = NONE (skip), modes 1..5 = active modes
+        impulse_per_mode = torch.stack([
+            head(imp_input) for head in self.impulse_heads
+        ], dim=-2)  # (B, K, K, num_active_modes, D)
 
-            # Mask by active modes and sum over interaction partners
-            raw_impulse = raw_impulse * active.unsqueeze(-1)
-            impulses = raw_impulse.sum(dim=2)  # (B, K, D)
+        # Weight by mode probabilities (exclude NONE mode)
+        active_weights = mode_weights[..., 1:]  # (B, K, K, num_active_modes)
+        weighted_impulse = (impulse_per_mode * active_weights.unsqueeze(-1)).sum(dim=-2)
+
+        # Sum over interaction partners
+        impulses = weighted_impulse.sum(dim=2)  # (B, K, D)
 
         # 4. Semi-implicit Euler integration
         v_new = v + self.dt * a_free + impulses
@@ -199,10 +212,9 @@ class HybridBeliefSimulator(nn.Module):
         return trajectory
 
     def energy(self, q: Tensor, v: Tensor, z: Tensor) -> Tensor:
-        """Compute total energy for passivity monitoring.
+        """Compute total energy.
 
-        Kinetic + potential (gravity). Used as a soft constraint,
-        not a hard Hamiltonian.
+        Kinetic + potential (gravity).
         """
         # Kinetic: 0.5 * ||v||^2 (mass=1 default, z could encode mass)
         ke = 0.5 * v.pow(2).sum(dim=-1)  # (B, K)
@@ -211,3 +223,17 @@ class HybridBeliefSimulator(nn.Module):
         pe = -(self.gravity.unsqueeze(0).unsqueeze(0) * q).sum(dim=-1)
 
         return (ke + pe).sum(dim=-1)  # (B,)
+
+    def passivity_loss(self, energies: list[Tensor]) -> Tensor:
+        """Penalize energy increase between steps.
+
+        In a passive system, energy can only decrease (dissipation)
+        or stay constant (conservation). Energy increase without
+        external input violates physics.
+        """
+        violations = []
+        for t in range(1, len(energies)):
+            delta_e = energies[t] - energies[t - 1]
+            # ReLU: only penalize increases, not decreases
+            violations.append(torch.relu(delta_e))
+        return torch.stack(violations).mean()

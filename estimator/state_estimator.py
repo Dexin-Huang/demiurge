@@ -69,14 +69,16 @@ class StateEstimator(nn.Module):
 
     def forward(
         self,
-        embeddings: Tensor,
+        patch_tokens: Tensor,
         object_features: Tensor | None = None,
     ) -> dict[str, Tensor]:
-        """Extract structured state from visual embeddings.
+        """Extract structured state from visual features.
 
         Args:
-            embeddings: (B, D) LeWM CLS token embeddings
+            patch_tokens: (B, N, D) spatial patch tokens from ViT encoder
+                          (excluding CLS). Use encoder output[:, 1:] to get these.
             object_features: (B, K, D_obj) optional GT object features
+                             (bypasses slot attention for ground-truth experiments)
 
         Returns:
             dict with:
@@ -88,7 +90,7 @@ class StateEstimator(nn.Module):
         if object_features is not None:
             slots = object_features
         else:
-            slots = self.slot_attention(embeddings)
+            slots = self.slot_attention(patch_tokens)
 
         q_v = self.geometry_head(slots)
         z = self.material_head(slots)
@@ -103,61 +105,86 @@ class StateEstimator(nn.Module):
 
 
 class SlotExtractor(nn.Module):
-    """Extract K object slots from dense visual features.
+    """Extract K object slots from dense visual features via slot attention.
 
-    For ground-truth experiments: uses provided object features.
-    For learned experiments: simplified slot attention.
+    Requires spatial patch tokens (not just CLS) to separate objects.
+    LeWM's ViT produces (B, N_patches+1, 192) — we use the N_patches
+    spatial tokens as the input set for slot attention.
     """
 
-    def __init__(self, input_dim: int, slot_dim: int, num_slots: int = 8):
+    def __init__(self, input_dim: int, slot_dim: int, num_slots: int = 8, n_iters: int = 3):
         super().__init__()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
+        self.n_iters = n_iters
 
         # Learnable slot initialization
         self.slot_mu = nn.Parameter(torch.randn(1, num_slots, slot_dim) * 0.02)
+        self.slot_log_sigma = nn.Parameter(torch.zeros(1, num_slots, slot_dim))
 
-        # Attention over input
+        # Project patch tokens to slot dimension
         self.project_input = nn.Linear(input_dim, slot_dim)
-        self.project_slots = nn.Linear(slot_dim, slot_dim)
-        self.gru = nn.GRUCell(slot_dim, slot_dim)
         self.norm_input = nn.LayerNorm(slot_dim)
-        self.norm_slots = nn.LayerNorm(slot_dim)
 
-    def forward(self, x: Tensor) -> Tensor:
+        # Slot attention components
+        self.project_q = nn.Linear(slot_dim, slot_dim)
+        self.project_k = nn.Linear(slot_dim, slot_dim)
+        self.project_v = nn.Linear(slot_dim, slot_dim)
+        self.gru = nn.GRUCell(slot_dim, slot_dim)
+        self.norm_slots = nn.LayerNorm(slot_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(slot_dim, slot_dim * 2),
+            nn.GELU(),
+            nn.Linear(slot_dim * 2, slot_dim),
+        )
+        self.norm_mlp = nn.LayerNorm(slot_dim)
+
+    def forward(self, patch_tokens: Tensor) -> Tensor:
         """
         Args:
-            x: (B, D) dense features
+            patch_tokens: (B, N, D) spatial patch tokens from ViT encoder
+                          (excluding CLS token). N = (H/patch)*(W/patch) = 256
+                          for 224x224 images with patch_size=14.
 
         Returns:
             slots: (B, K, D_slot)
         """
-        B = x.shape[0]
+        B, N, _ = patch_tokens.shape
 
-        # Initialize slots
-        slots = self.slot_mu.expand(B, -1, -1)
+        # Project inputs
+        inputs = self.norm_input(self.project_input(patch_tokens))  # (B, N, D_slot)
 
-        # Project input — broadcast CLS to spatial dimension
-        inputs = self.project_input(x).unsqueeze(1)  # (B, 1, D)
-        inputs = self.norm_input(inputs)
+        # Initialize slots with learned Gaussian
+        slots = self.slot_mu + self.slot_log_sigma.exp() * torch.randn_like(
+            self.slot_mu.expand(B, -1, -1)
+        )
 
-        # Iterative attention (3 iterations)
-        for _ in range(3):
+        # Iterative slot attention
+        for _ in range(self.n_iters):
             slots_prev = slots
             slots = self.norm_slots(slots)
 
-            # Attention: slots attend to input
-            q = self.project_slots(slots)  # (B, K, D)
-            attn = torch.einsum("bkd,bnd->bkn", q, inputs)  # (B, K, 1)
-            attn = attn / (self.slot_dim ** 0.5)
-            attn = attn.softmax(dim=1)
+            # Attention: slots (queries) attend to input patches (keys/values)
+            q = self.project_q(slots)   # (B, K, D)
+            k = self.project_k(inputs)  # (B, N, D)
+            v = self.project_v(inputs)  # (B, N, D)
 
-            updates = torch.einsum("bkn,bnd->bkd", attn, inputs)  # (B, K, D)
+            # Dot-product attention
+            attn = torch.einsum("bkd,bnd->bkn", q, k) / (self.slot_dim ** 0.5)
+
+            # Normalize over slots (competition for patches)
+            attn = attn.softmax(dim=1)  # (B, K, N) — slots compete
+
+            # Weighted sum of values
+            updates = torch.einsum("bkn,bnd->bkd", attn, v)  # (B, K, D)
 
             # GRU update
             slots = self.gru(
                 updates.reshape(-1, self.slot_dim),
                 slots_prev.reshape(-1, self.slot_dim),
             ).reshape(B, self.num_slots, self.slot_dim)
+
+            # MLP residual
+            slots = slots + self.mlp(self.norm_mlp(slots))
 
         return slots

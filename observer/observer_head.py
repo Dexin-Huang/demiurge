@@ -34,12 +34,16 @@ class ObserverHead(nn.Module):
         num_slots: int = 8,
         embed_dim: int = 192,
         hidden_dim: int = 256,
+        noise_std: float = 0.1,
     ):
         super().__init__()
         self.embed_dim = embed_dim
+        self.noise_std = noise_std
 
-        # Per-slot state → embedding contribution
-        slot_input = state_dim * 2 + material_dim  # q, v, z
+        # Observer only sees (q, v) from the simulator — NOT z directly.
+        # z's effect is only visible through how it changed (q, v).
+        # This forces the simulator to actually use z to transform dynamics.
+        slot_input = state_dim * 2  # q, v only
         self.slot_encoder = nn.Sequential(
             nn.Linear(slot_input, hidden_dim),
             nn.GELU(),
@@ -57,20 +61,29 @@ class ObserverHead(nn.Module):
         self,
         q: Tensor,
         v: Tensor,
-        z: Tensor,
+        z: Tensor | None = None,
     ) -> Tensor:
         """Predict latent embedding from simulated state.
+
+        The observer only sees (q, v) — NOT z. The material code z
+        influences predictions only through the simulator's dynamics.
+        This prevents the observer from bypassing the simulator.
 
         Args:
             q: (B, K, D) positions
             v: (B, K, D) velocities
-            z: (B, K, M) material codes
+            z: ignored (kept in signature for API consistency)
 
         Returns:
             predicted_emb: (B, embed_dim)
         """
-        # Per-slot encoding
-        slot_input = torch.cat([q, v, z], dim=-1)  # (B, K, D+D+M)
+        # Per-slot encoding — q and v only
+        slot_input = torch.cat([q, v], dim=-1)  # (B, K, 2D)
+
+        # Add noise during training to prevent memorization
+        if self.training and self.noise_std > 0:
+            slot_input = slot_input + self.noise_std * torch.randn_like(slot_input)
+
         slot_features = self.slot_encoder(slot_input)  # (B, K, H)
 
         # Mean-pool across slots
