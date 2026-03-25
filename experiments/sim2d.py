@@ -137,47 +137,100 @@ class Sim2D:
             "elasticities": elasticities,
         }
 
+    def render(self, size: int = 224) -> np.ndarray:
+        """Render current state as an RGB image.
+
+        Args:
+            size: output image size (square)
+
+        Returns:
+            (size, size, 3) uint8 RGB image
+        """
+        import pygame
+        if not hasattr(self, '_surface'):
+            pygame.init()
+            self._surface = pygame.Surface((size, size))
+
+        self._surface.fill((40, 40, 40))  # dark background
+
+        # Scale factor from sim coords to pixel coords
+        scale = size / self.config.width
+
+        # Draw walls
+        pygame.draw.rect(self._surface, (100, 100, 100),
+                         (0, 0, size, size), 2)
+
+        # Draw objects with color based on mass (for visual diversity)
+        colors = [
+            (255, 100, 100), (100, 255, 100), (100, 100, 255),
+            (255, 255, 100), (100, 255, 255), (255, 100, 255),
+            (255, 180, 100), (180, 100, 255),
+        ]
+
+        for i, (body, shape) in enumerate(zip(self.bodies, self.shapes)):
+            x = int(body.position.x * scale)
+            y = size - int(body.position.y * scale)  # flip y
+            r = int(shape.radius * scale)
+            color = colors[i % len(colors)]
+            pygame.draw.circle(self._surface, color, (x, y), r)
+            # Darker outline
+            pygame.draw.circle(self._surface, (0, 0, 0), (x, y), r, 2)
+
+        # Convert to numpy
+        arr = pygame.surfarray.array3d(self._surface)
+        arr = arr.transpose(1, 0, 2)  # (W, H, 3) -> (H, W, 3)
+        return arr.copy()
+
     def step(self):
         """Advance simulation by one timestep."""
         dt_sub = self.config.dt / self.config.substeps
         for _ in range(self.config.substeps):
             self.space.step(dt_sub)
 
-    def rollout(self, n_steps: int) -> dict[str, np.ndarray]:
+    def rollout(self, n_steps: int, render: bool = False, render_size: int = 224) -> dict[str, np.ndarray]:
         """Run simulation for n_steps and collect trajectory.
 
         Returns:
             dict with:
-                positions: (T, K, 2)
-                velocities: (T, K, 2)
-                masses: (K,) — constant per object
-                frictions: (K,) — constant per object
-                elasticities: (K,) — constant per object
+                positions: (T+1, K, 2)
+                velocities: (T+1, K, 2)
+                masses: (K,)
+                frictions: (K,)
+                elasticities: (K,)
                 contacts: list of contact events
+                frames: (T+1, H, W, 3) uint8 — only if render=True
         """
         self.contacts = []
         trajectory = {"positions": [], "velocities": []}
+        frames = [] if render else None
 
         for t in range(n_steps):
             self._current_step = t
             state = self.get_state()
             trajectory["positions"].append(state["positions"])
             trajectory["velocities"].append(state["velocities"])
+            if render:
+                frames.append(self.render(render_size))
             self.step()
 
         # Final state
         state = self.get_state()
         trajectory["positions"].append(state["positions"])
         trajectory["velocities"].append(state["velocities"])
+        if render:
+            frames.append(self.render(render_size))
 
-        return {
-            "positions": np.stack(trajectory["positions"]),  # (T+1, K, 2)
+        result = {
+            "positions": np.stack(trajectory["positions"]),
             "velocities": np.stack(trajectory["velocities"]),
             "masses": state["masses"],
             "frictions": state["frictions"],
             "elasticities": state["elasticities"],
             "contacts": self.contacts,
         }
+        if render:
+            result["frames"] = np.stack(frames)  # (T+1, H, W, 3)
+        return result
 
 
 def generate_dataset(
@@ -187,6 +240,8 @@ def generate_dataset(
     mass_range: tuple[float, float] = (0.5, 5.0),
     friction_range: tuple[float, float] = (0.1, 0.9),
     elasticity_range: tuple[float, float] = (0.3, 0.95),
+    render: bool = False,
+    render_size: int = 224,
     seed: int = 42,
 ) -> dict[str, torch.Tensor]:
     """Generate a dataset of 2D physics trajectories.
@@ -205,6 +260,7 @@ def generate_dataset(
     all_pos, all_vel = [], []
     all_mass, all_fric, all_elast = [], [], []
     all_contacts = []
+    all_frames = [] if render else None
 
     for traj_idx in range(n_trajectories):
         objects = []
@@ -221,13 +277,15 @@ def generate_dataset(
 
         config = SimConfig(objects=objects)
         sim = Sim2D(config)
-        traj = sim.rollout(n_steps)
+        traj = sim.rollout(n_steps, render=render, render_size=render_size)
 
         all_pos.append(traj["positions"])
         all_vel.append(traj["velocities"])
         all_mass.append(traj["masses"])
         all_fric.append(traj["frictions"])
         all_elast.append(traj["elasticities"])
+        if render:
+            all_frames.append(traj["frames"])
 
         # Build contact matrix per step
         contact_mat = np.zeros((n_steps, n_objects, n_objects), dtype=np.float32)
@@ -246,7 +304,7 @@ def generate_dataset(
     positions = np.stack(all_pos) / 500.0
     velocities = np.stack(all_vel) / 500.0
 
-    return {
+    result = {
         "positions": torch.from_numpy(positions),
         "velocities": torch.from_numpy(velocities),
         "masses": torch.from_numpy(np.stack(all_mass)),
@@ -254,6 +312,11 @@ def generate_dataset(
         "elasticities": torch.from_numpy(np.stack(all_elast)),
         "contact_matrices": torch.from_numpy(np.stack(all_contacts)),
     }
+    if render:
+        # (N, T+1, H, W, 3) -> (N, T+1, 3, H, W) for PyTorch
+        frames = np.stack(all_frames)
+        result["frames"] = torch.from_numpy(frames).permute(0, 1, 4, 2, 3)
+    return result
 
 
 if __name__ == "__main__":
