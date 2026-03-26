@@ -76,9 +76,17 @@ class DemiurgeV3(nn.Module):
             dt=dt,
         )
 
-    def extract_slots(self, patch_tokens: Tensor) -> dict[str, Tensor]:
-        """Extract and decompose object slots from patch tokens."""
-        slots, attn = self.slot_attention(patch_tokens)
+    def extract_slots(
+        self, patch_tokens: Tensor, prev_slots: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        """Extract and decompose object slots from patch tokens.
+
+        Args:
+            patch_tokens: (B, N, 192)
+            prev_slots: (B, K, D_slot) predicted slots from previous frame.
+                        If None, this is frame 0 (discovery mode).
+        """
+        slots, attn = self.slot_attention(patch_tokens, prev_slots=prev_slots)
         decomp = self.decomposer.decompose(slots)
         return {
             "slots": slots,
@@ -219,20 +227,157 @@ class DemiurgeV3(nn.Module):
         labels = torch.zeros(pred.shape[0], dtype=torch.long, device=pred.device)
         return F.cross_entropy(logits, labels)
 
+    def forward_temporal(
+        self,
+        patch_sequence: Tensor,
+        actions: Tensor | None = None,
+        gt_states: Tensor | None = None,
+    ) -> dict:
+        """Temporal predict-update loop over a sequence of frames.
+
+        This is the core architecture: Kalman-style estimation where
+        the Interaction Network predicts and slot attention corrects.
+
+        Args:
+            patch_sequence: (B, T, N, 192) patch tokens for T frames
+            actions: (B, T-1, action_dim) actions between frames, or None
+            gt_states: (B, T, K_obj, 4) GT states for supervision, or None
+
+        Returns:
+            dict with per-step corrected states, innovations, losses
+        """
+        B, T, N, D = patch_sequence.shape
+
+        # Frame 0: discovery — initialize from learned prior
+        corrected = self.extract_slots(patch_sequence[:, 0], prev_slots=None)
+        state = corrected["state"]
+        static = corrected["static"]
+        slots = corrected["slots"]
+
+        all_states = [state]
+        all_innovations = []
+        all_effects = []
+        all_predicted_states = []
+        total_state_loss = torch.tensor(0.0, device=patch_sequence.device)
+        total_innovation_norm = torch.tensor(0.0, device=patch_sequence.device)
+
+        # GT supervision for frame 0
+        if gt_states is not None:
+            K_obj = gt_states.shape[2]
+            perm = hungarian_match(state[:, :, :2], gt_states[:, 0, :, :2])
+            matched = apply_permutation(state, perm)
+            total_state_loss = total_state_loss + F.mse_loss(matched[:, :K_obj], gt_states[:, 0])
+
+        for t in range(T - 1):
+            # === PREDICT: Interaction Network rolls state forward ===
+            act = actions[:, t] if actions is not None else None
+            dyn_out = self.predict_next(state, action=act)
+            predicted_state = dyn_out["next_state"]
+            all_effects.append(dyn_out["effects"])
+
+            # Reassemble predicted state into predicted slots
+            predicted_slots = self.decomposer.assemble(static, predicted_state)
+
+            # === UPDATE: Slot attention corrects prediction with observation ===
+            corrected = self.extract_slots(
+                patch_sequence[:, t + 1],
+                prev_slots=predicted_slots,  # <-- THE KEY CHANGE
+            )
+            corrected_state = corrected["state"]
+            static = corrected["static"]  # update appearance from new frame
+            slots = corrected["slots"]
+
+            # === INNOVATION: the surprise signal ===
+            # innovation = corrected - predicted (what we saw vs what we expected)
+            innovation = corrected_state - predicted_state
+            innovation_norm = innovation.pow(2).sum(dim=(-1, -2))  # (B,)
+
+            all_states.append(corrected_state)
+            all_innovations.append(innovation_norm)
+            all_predicted_states.append(predicted_state)
+            total_innovation_norm = total_innovation_norm + innovation_norm.mean()
+
+            # GT supervision
+            if gt_states is not None:
+                perm = hungarian_match(corrected_state[:, :, :2], gt_states[:, t + 1, :, :2])
+                matched = apply_permutation(corrected_state, perm)
+                total_state_loss = total_state_loss + F.mse_loss(matched[:, :K_obj], gt_states[:, t + 1])
+
+                # Also supervise the prediction
+                pred_matched = apply_permutation(predicted_state, perm)
+                total_state_loss = total_state_loss + 0.5 * F.mse_loss(pred_matched[:, :K_obj], gt_states[:, t + 1])
+
+            # Update state for next iteration
+            state = corrected_state
+
+        # Compute losses
+        n_steps = T - 1
+        losses = {}
+        losses["state"] = total_state_loss / max(n_steps + 1, 1)  # +1 for frame 0
+        losses["innovation"] = total_innovation_norm / max(n_steps, 1)
+
+        # Energy conservation (non-agent slots)
+        losses["energy"] = self._energy_loss_no_agent(
+            all_states[0], all_states[-1]
+        )
+
+        # Newton 3
+        loss_newton = torch.tensor(0.0, device=patch_sequence.device)
+        for eff in all_effects:
+            loss_newton = loss_newton + self.dynamics.newton3_loss(eff)
+        losses["newton3"] = loss_newton / max(len(all_effects), 1)
+
+        # Round-trip consistency: decompose(assemble(static, state)) ≈ state
+        # Prevents encoder/decoder mismatch from creating false innovation
+        rt_state = self.decomposer.decompose(
+            self.decomposer.assemble(static, state)
+        )["state"]
+        losses["roundtrip"] = F.mse_loss(rt_state, state.detach())
+
+        # Static regularization: penalize temporal change in static codes
+        # Prevents appearance from leaking dynamics
+        if len(all_states) > 1:
+            static_init = self.decomposer.decompose(
+                self.slot_attention(patch_sequence[:, 0])[0]
+            )["static"]
+            losses["static_reg"] = F.mse_loss(static, static_init.detach())
+        else:
+            losses["static_reg"] = torch.tensor(0.0, device=patch_sequence.device)
+
+        # Total
+        losses["total"] = (
+            losses["state"]
+            + self.lambda_energy * losses["energy"]
+            + self.lambda_newton * losses["newton3"]
+            + 0.1 * losses["roundtrip"]
+            + 0.05 * losses["static_reg"]
+        )
+
+        return {
+            "losses": losses,
+            "states": all_states,
+            "innovations": all_innovations,
+            "predicted_states": all_predicted_states,
+            "effects": all_effects,
+        }
+
     def rollout(
         self,
         patch_tokens_init: Tensor,
         actions: Tensor | None = None,
         n_steps: int = 8,
     ) -> dict[str, list[Tensor]]:
-        """Roll forward with action conditioning.
+        """Roll forward WITHOUT observations (pure prediction).
+
+        Used for planning/shield: predict what will happen if we
+        take these actions, without seeing the actual future frames.
 
         Args:
-            patch_tokens_init: (B, N, 192)
-            actions: (B, T, action_dim) action sequence, or None
+            patch_tokens_init: (B, N, 192) initial frame only
+            actions: (B, T, action_dim) planned action sequence
             n_steps: steps to simulate
         """
-        current = self.extract_slots(patch_tokens_init)
+        current = self.extract_slots(patch_tokens_init, prev_slots=None)
         state = current["state"]
         static = current["static"]
 
@@ -254,30 +399,38 @@ class DemiurgeV3(nn.Module):
         patch_tokens_t: Tensor,
         patch_tokens_t1: Tensor,
         action: Tensor | None = None,
-    ) -> Tensor:
-        """Compute VoE score: model's own prediction error.
+        prev_slots: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        """Compute VoE as the innovation from the predict-update cycle.
 
-        VoE = ||predicted_state - observed_state||²
-
-        This is the RIGHT metric: how surprised is the model by
-        what actually happened vs what it predicted?
+        This is the mathematically correct surprise signal:
+        innovation = corrected_state - predicted_state
 
         Args:
             patch_tokens_t: (B, N, 192) current frame
-            patch_tokens_t1: (B, N, 192) next frame (what actually happened)
+            patch_tokens_t1: (B, N, 192) next frame
             action: (B, action_dim) action taken
+            prev_slots: (B, K, D_slot) slots from previous step (for tracking)
 
         Returns:
-            voe: (B,) per-sample surprise score
+            voe: (B,) per-sample surprise (innovation norm)
+            innovation: (B, K, 4) per-slot innovation vector
         """
-        current = self.extract_slots(patch_tokens_t)
-        observed = self.extract_slots(patch_tokens_t1)
+        # Extract current state (with tracking if prev_slots given)
+        current = self.extract_slots(patch_tokens_t, prev_slots=prev_slots)
 
+        # PREDICT
         predicted = self.predict_next(current["state"], action=action)
+        predicted_slots = self.decomposer.assemble(current["static"], predicted["next_state"])
 
-        # Surprise = MSE between predicted and observed state
-        voe = (predicted["next_state"] - observed["state"]).pow(2).sum(dim=(-1, -2))
-        return voe
+        # UPDATE (correct prediction with observation)
+        corrected = self.extract_slots(patch_tokens_t1, prev_slots=predicted_slots)
+
+        # INNOVATION = corrected - predicted
+        innovation = corrected["state"] - predicted["next_state"]
+        voe = innovation.pow(2).sum(dim=(-1, -2))  # (B,)
+
+        return voe, innovation
 
     def count_params(self) -> dict[str, int]:
         counts = {}

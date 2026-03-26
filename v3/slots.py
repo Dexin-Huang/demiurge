@@ -14,10 +14,21 @@ from scipy.optimize import linear_sum_assignment
 
 
 class SlotAttention(nn.Module):
-    """Slot Attention (Locatello et al., 2020) over ViT patch tokens.
+    """Slot Attention with Predict-Update Cycle.
 
-    K slots compete for N patch tokens via iterative attention.
-    Each slot learns to bind to one object (or background).
+    Implements the classical Kalman-style estimation loop:
+        PREDICT: Interaction Network propagates slots forward
+        UPDATE:  Slot attention corrects prediction with new observation
+
+    Frame 0: slots initialized from learned prior (discovery)
+    Frame t>0: slots initialized from predicted state (tracking)
+
+    The GRU inside slot attention acts as a learned, nonlinear
+    Kalman gain — fusing prediction with observation.
+
+    When an object is occluded (no matching patches), the attention
+    weights are near-uniform, the GRU update is small, and the slot
+    coasts on its prediction. Object permanence for free.
     """
 
     def __init__(
@@ -32,7 +43,7 @@ class SlotAttention(nn.Module):
         self.slot_dim = slot_dim
         self.n_iters = n_iters
 
-        # Learnable slot initialization
+        # Learnable slot initialization (used only for frame 0 — discovery)
         self.slot_mu = nn.Parameter(torch.randn(1, num_slots, slot_dim) * 0.02)
         self.slot_log_sigma = nn.Parameter(torch.zeros(1, num_slots, slot_dim))
 
@@ -45,7 +56,7 @@ class SlotAttention(nn.Module):
         self.project_k = nn.Linear(slot_dim, slot_dim)
         self.project_v = nn.Linear(slot_dim, slot_dim)
 
-        # Update
+        # Update (GRU acts as learned Kalman gain)
         self.gru = nn.GRUCell(slot_dim, slot_dim)
         self.norm_slots = nn.LayerNorm(slot_dim)
         self.mlp = nn.Sequential(
@@ -55,25 +66,37 @@ class SlotAttention(nn.Module):
         )
         self.norm_mlp = nn.LayerNorm(slot_dim)
 
-    def forward(self, patch_tokens: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        patch_tokens: Tensor,
+        prev_slots: Tensor | None = None,
+    ) -> tuple[Tensor, Tensor]:
         """
         Args:
             patch_tokens: (B, N, D) ViT patch tokens (excluding CLS)
+            prev_slots: (B, K, D_slot) predicted slots from previous frame.
+                        If None, initialize from learned prior (frame 0).
 
         Returns:
-            slots: (B, K, D_slot) slot embeddings
-            attn_weights: (B, K, N) attention weights (for visualization)
+            slots: (B, K, D_slot) corrected slot embeddings
+            attn_weights: (B, K, N) attention weights
         """
         B, N, _ = patch_tokens.shape
         K = self.num_slots
 
         inputs = self.norm_input(self.project_input(patch_tokens))
 
-        # Initialize with noise for symmetry breaking
-        slots = self.slot_mu + self.slot_log_sigma.exp() * torch.randn(
-            B, K, self.slot_dim, device=patch_tokens.device
-        )
+        # INIT: from prediction (tracking) or learned prior (discovery)
+        if prev_slots is not None:
+            # Tracking: initialize from predicted slots
+            slots = prev_slots
+        else:
+            # Discovery: initialize from learned prior with noise
+            slots = self.slot_mu + self.slot_log_sigma.exp() * torch.randn(
+                B, K, self.slot_dim, device=patch_tokens.device
+            )
 
+        # UPDATE: iterative attention corrects the prediction
         attn_weights = None
         for _ in range(self.n_iters):
             slots_prev = slots
@@ -87,10 +110,11 @@ class SlotAttention(nn.Module):
             attn = torch.einsum("bkd,bnd->bkn", q, k) / (self.slot_dim ** 0.5)
             attn_weights = attn.softmax(dim=1)  # (B, K, N) — normalized over K
 
-            # Weighted sum
+            # Weighted sum of observations
             updates = torch.einsum("bkn,bnd->bkd", attn_weights, v)
 
-            # GRU + MLP residual
+            # GRU: fuses prediction (slots_prev) with observation (updates)
+            # This IS the learned Kalman gain
             slots = self.gru(
                 updates.reshape(-1, self.slot_dim),
                 slots_prev.reshape(-1, self.slot_dim),
