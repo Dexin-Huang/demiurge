@@ -41,7 +41,7 @@ def extract_patches(lewm, pixels):
     return rearrange(patches, "(b t) n d -> b t n d", b=B)
 
 
-def parse_gt_state(state, num_slots=3):
+def parse_gt_state(state, num_slots=4):
     """Push-T state → per-object (q_x, q_y, v_x, v_y).
     Returns (B, T, K_obj, 4) where K_obj=2 (agent + block only, no bg)."""
     B, T, _ = state.shape
@@ -118,7 +118,7 @@ def train(
     # 3. Build model
     model = DemiurgeV3(
         input_dim=192, slot_dim=128, static_dim=64,
-        state_dim=4, action_dim=2, num_slots=3, agent_slot=0,
+        state_dim=4, action_dim=2, num_slots=4, agent_slot=0,
         dt=5.0 / 60.0,
         lambda_contrast=0.05,
         lambda_energy=0.1,

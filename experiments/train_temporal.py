@@ -105,7 +105,7 @@ def train(
     # Build model
     model = DemiurgeV3(
         input_dim=192, slot_dim=128, static_dim=64,
-        state_dim=4, action_dim=2, num_slots=3, agent_slot=0,
+        state_dim=4, action_dim=2, num_slots=4, agent_slot=0,
         dt=5.0 / 60.0,
         lambda_energy=0.1, lambda_newton=0.1, lambda_state=1.0,
     ).to(device)

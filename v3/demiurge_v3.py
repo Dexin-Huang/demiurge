@@ -36,7 +36,7 @@ class DemiurgeV3(nn.Module):
         static_dim: int = 64,
         state_dim: int = 4,
         action_dim: int = 2,
-        num_slots: int = 3,
+        num_slots: int = 4,
         agent_slot: int = 0,       # which slot is the agent (for energy exclusion)
         dt: float = 5.0 / 60.0,
         lambda_contrast: float = 0.1,
@@ -147,9 +147,9 @@ class DemiurgeV3(nn.Module):
         # Predict next state with action
         dyn_out = self.predict_next(current["state"], action=action)
 
-        # Reassemble slots
+        # Reassemble slots (gated residual)
         predicted_slots = self.decomposer.assemble(
-            current["static"], dyn_out["next_state"]
+            current["static"], dyn_out["next_state"], prev_slot=current["slots"]
         )
         target_slots = target["slots"]
 
@@ -160,7 +160,7 @@ class DemiurgeV3(nn.Module):
         # Contrastive loss on matched slots only
         if perm_t is not None:
             matched_pred = apply_permutation(predicted_slots, perm_t)
-            matched_tgt = apply_permutation(target_slots, perm_t)
+            matched_tgt = apply_permutation(target_slots, perm_t1)  # use t+1 perm for target
             neg = matched_tgt[torch.randperm(matched_tgt.shape[0])]
             losses["contrast"] = self._contrastive_loss(matched_pred, matched_tgt, neg)
         else:
@@ -427,7 +427,7 @@ class DemiurgeV3(nn.Module):
 
         # PREDICT
         predicted = self.predict_next(current["state"], action=action)
-        predicted_slots = self.decomposer.assemble(current["static"], predicted["next_state"])
+        predicted_slots = self.decomposer.assemble(current["static"], predicted["next_state"], prev_slot=current["slots"])
 
         # UPDATE (correct prediction with observation)
         corrected = self.extract_slots(patch_tokens_t1, prev_slots=predicted_slots)

@@ -96,7 +96,7 @@ def run(
     print("Loading DEMIURGE v0.3...")
     model = DemiurgeV3(
         input_dim=192, slot_dim=128, static_dim=64,
-        state_dim=4, action_dim=2, num_slots=3, agent_slot=0,
+        state_dim=4, action_dim=2, num_slots=4, agent_slot=0,
         dt=5.0 / 60.0,
     ).to(device)
     model.load_state_dict(torch.load(model_weights, map_location=device, weights_only=True))
