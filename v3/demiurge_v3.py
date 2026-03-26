@@ -71,8 +71,9 @@ class DemiurgeV3(nn.Module):
             state_dim=state_dim,
             edge_dim=state_dim + 1,
             action_dim=action_dim,
-            effect_dim=32,
-            hidden_dim=64,
+            effect_dim=128,
+            hidden_dim=256,
+            n_message_passes=2,
             dt=dt,
         )
 
@@ -155,12 +156,16 @@ class DemiurgeV3(nn.Module):
         # === Losses ===
         losses = {}
 
-        # 1. Slot prediction (weak, just keeps slot attention alive)
-        losses["slot"] = F.mse_loss(predicted_slots, target_slots.detach())
-
-        # 2. Contrastive loss
-        neg = target_slots[torch.randperm(target_slots.shape[0])]
-        losses["contrast"] = self._contrastive_loss(predicted_slots, target_slots, neg)
+        # Slot loss DROPPED — it fights state loss (unordered vs Hungarian-matched)
+        # Contrastive loss on matched slots only
+        if perm_t is not None:
+            matched_pred = apply_permutation(predicted_slots, perm_t)
+            matched_tgt = apply_permutation(target_slots, perm_t)
+            neg = matched_tgt[torch.randperm(matched_tgt.shape[0])]
+            losses["contrast"] = self._contrastive_loss(matched_pred, matched_tgt, neg)
+        else:
+            neg = target_slots[torch.randperm(target_slots.shape[0])]
+            losses["contrast"] = self._contrastive_loss(predicted_slots, target_slots, neg)
 
         # 3. Energy conservation — EXCLUDE agent slot (agent injects energy)
         losses["energy"] = self._energy_loss_no_agent(
@@ -177,9 +182,8 @@ class DemiurgeV3(nn.Module):
             losses["state_t"] = F.mse_loss(matched_state_t, gt_state_t)
             losses["state_t1"] = F.mse_loss(pred_matched[:, :K_obj], gt_state_t1)
 
-        # Total
-        total = 0.1 * losses["slot"]  # weak slot loss
-        total = total + self.lambda_contrast * losses["contrast"]
+        # Total (no slot loss — it conflicts with Hungarian-matched state loss)
+        total = self.lambda_contrast * losses["contrast"]
         total = total + self.lambda_energy * losses["energy"]
         total = total + self.lambda_newton * losses["newton3"]
         if "state_t" in losses:
@@ -275,8 +279,8 @@ class DemiurgeV3(nn.Module):
             predicted_state = dyn_out["next_state"]
             all_effects.append(dyn_out["effects"])
 
-            # Reassemble predicted state into predicted slots
-            predicted_slots = self.decomposer.assemble(static, predicted_state)
+            # Reassemble predicted state into predicted slots (gated residual)
+            predicted_slots = self.decomposer.assemble(static, predicted_state, prev_slot=slots)
 
             # === UPDATE: Slot attention corrects prediction with observation ===
             corrected = self.extract_slots(
@@ -383,11 +387,13 @@ class DemiurgeV3(nn.Module):
 
         trajectory = {"states": [state], "slots": [current["slots"]]}
 
+        slots = current["slots"]
         for t in range(n_steps):
             act = actions[:, t] if actions is not None and t < actions.shape[1] else None
             dyn_out = self.predict_next(state, action=act)
             state = dyn_out["next_state"]
-            pred_slot = self.decomposer.assemble(static, state)
+            pred_slot = self.decomposer.assemble(static, state, prev_slot=slots)
+            slots = pred_slot
 
             trajectory["states"].append(state)
             trajectory["slots"].append(pred_slot)

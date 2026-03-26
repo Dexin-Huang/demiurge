@@ -35,13 +35,15 @@ class SlotAttention(nn.Module):
         self,
         input_dim: int = 192,
         slot_dim: int = 128,
-        num_slots: int = 3,
-        n_iters: int = 3,
+        num_slots: int = 4,
+        n_iters_init: int = 3,   # more iters for discovery (frame 0)
+        n_iters_track: int = 1,  # fewer for tracking (predicted prior is good)
     ):
         super().__init__()
         self.num_slots = num_slots
         self.slot_dim = slot_dim
-        self.n_iters = n_iters
+        self.n_iters_init = n_iters_init
+        self.n_iters_track = n_iters_track
 
         # Learnable slot initialization (used only for frame 0 — discovery)
         self.slot_mu = nn.Parameter(torch.randn(1, num_slots, slot_dim) * 0.02)
@@ -88,33 +90,34 @@ class SlotAttention(nn.Module):
 
         # INIT: from prediction (tracking) or learned prior (discovery)
         if prev_slots is not None:
-            # Tracking: initialize from predicted slots
             slots = prev_slots
+            n_iters = self.n_iters_track  # 1 iter — predicted prior is good
         else:
-            # Discovery: initialize from learned prior with noise
             slots = self.slot_mu + self.slot_log_sigma.exp() * torch.randn(
                 B, K, self.slot_dim, device=patch_tokens.device
             )
+            n_iters = self.n_iters_init  # 3 iters — discovering from scratch
 
         # UPDATE: iterative attention corrects the prediction
         attn_weights = None
-        for _ in range(self.n_iters):
+        for _ in range(n_iters):
             slots_prev = slots
             slots = self.norm_slots(slots)
 
-            q = self.project_q(slots)    # (B, K, D)
-            k = self.project_k(inputs)   # (B, N, D)
-            v = self.project_v(inputs)   # (B, N, D)
+            q = self.project_q(slots)
+            k = self.project_k(inputs)
+            v = self.project_v(inputs)
 
-            # Attention: softmax over SLOTS (they compete for patches)
-            attn = torch.einsum("bkd,bnd->bkn", q, k) / (self.slot_dim ** 0.5)
-            attn_weights = attn.softmax(dim=1)  # (B, K, N) — normalized over K
+            # Attention with proper renormalization (standard Slot Attention)
+            attn_logits = torch.einsum("bkd,bnd->bkn", q, k) / (self.slot_dim ** 0.5)
+            attn_weights = attn_logits.softmax(dim=1)  # (B, K, N) — slots compete
+            # Renormalize: each patch's contribution weighted by how much
+            # attention it receives total (prevents patches from being double-counted)
+            attn_weights = attn_weights / (attn_weights.sum(dim=-1, keepdim=True) + 1e-8)
 
-            # Weighted sum of observations
             updates = torch.einsum("bkn,bnd->bkd", attn_weights, v)
 
             # GRU: fuses prediction (slots_prev) with observation (updates)
-            # This IS the learned Kalman gain
             slots = self.gru(
                 updates.reshape(-1, self.slot_dim),
                 slots_prev.reshape(-1, self.slot_dim),
@@ -135,6 +138,7 @@ class SlotDecomposer(nn.Module):
         super().__init__()
         self.static_dim = static_dim
         self.state_dim = state_dim
+        self.slot_dim = slot_dim
 
         # Static head: slot → appearance code
         self.static_head = nn.Sequential(
@@ -150,12 +154,16 @@ class SlotDecomposer(nn.Module):
             nn.Linear(slot_dim, state_dim),
         )
 
-        # Dynamic encoder: (q, v) → dynamic embedding
-        # Used to reassemble predicted state back into slot space
-        self.dynamic_encoder = nn.Sequential(
-            nn.Linear(state_dim, slot_dim),
+        # Gated residual for assembling predicted slots
+        # Instead of hard cat, use: slot_pred = prev_slot + gate * MLP([prev_slot, static, dyn_emb])
+        self.assemble_mlp = nn.Sequential(
+            nn.Linear(slot_dim + static_dim + state_dim, slot_dim),
             nn.GELU(),
-            nn.Linear(slot_dim, slot_dim - static_dim),
+            nn.Linear(slot_dim, slot_dim),
+        )
+        self.assemble_gate = nn.Sequential(
+            nn.Linear(slot_dim + static_dim + state_dim, slot_dim),
+            nn.Sigmoid(),
         )
 
     def decompose(self, slots: Tensor) -> dict[str, Tensor]:
@@ -173,18 +181,28 @@ class SlotDecomposer(nn.Module):
             "state": self.dynamic_head(slots),
         }
 
-    def assemble(self, static: Tensor, state: Tensor) -> Tensor:
-        """Reassemble predicted state + carried static into slot embedding.
+    def assemble(self, static: Tensor, state: Tensor, prev_slot: Tensor | None = None) -> Tensor:
+        """Reassemble predicted state into slot embedding via gated residual.
+
+        Instead of hard cat (which loses information), uses:
+            slot_pred = prev_slot + gate * MLP([prev_slot, static, state])
 
         Args:
-            static: (B, K, D_static) appearance (from current frame)
+            static: (B, K, D_static) appearance
             state: (B, K, 4) predicted (q', v')
+            prev_slot: (B, K, D_slot) previous slot (for residual). If None, uses zero.
 
         Returns:
-            slot: (B, K, D_slot) reassembled slot
+            slot: (B, K, D_slot) assembled slot
         """
-        dynamic_emb = self.dynamic_encoder(state)
-        return torch.cat([static, dynamic_emb], dim=-1)
+        B, K, _ = state.shape
+        if prev_slot is None:
+            prev_slot = torch.zeros(B, K, self.slot_dim, device=state.device)
+
+        combined = torch.cat([prev_slot, static, state], dim=-1)
+        update = self.assemble_mlp(combined)
+        gate = self.assemble_gate(combined)
+        return prev_slot + gate * update
 
 
 def hungarian_match(

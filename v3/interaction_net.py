@@ -31,11 +31,12 @@ class InteractionNetwork(nn.Module):
 
     def __init__(
         self,
-        state_dim: int = 4,     # (q_x, q_y, v_x, v_y)
-        edge_dim: int = 5,      # (Δq_x, Δq_y, Δv_x, Δv_y, dist)
-        action_dim: int = 2,    # per-object action (Push-T: 2D force on agent)
-        effect_dim: int = 32,
-        hidden_dim: int = 64,
+        state_dim: int = 4,
+        edge_dim: int = 5,
+        action_dim: int = 2,
+        effect_dim: int = 128,    # scaled up from 32
+        hidden_dim: int = 256,    # scaled up from 64
+        n_message_passes: int = 2,  # 2 rounds of message passing
         dt: float = 5.0 / 60.0,
     ):
         super().__init__()
@@ -43,27 +44,40 @@ class InteractionNetwork(nn.Module):
         self.state_dim = state_dim
         self.action_dim = action_dim
         self.pos_dim = state_dim // 2
+        self.n_message_passes = n_message_passes
 
-        # Action projection: per-object action → force embedding
+        # Action projection
         self.action_proj = nn.Sequential(
             nn.Linear(action_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, self.pos_dim),  # action contributes to Δv
+            nn.Linear(hidden_dim, self.pos_dim),
         )
 
-        # φ_R: relational model (per edge)
+        # φ_R: relational model — 2 layers for expressivity
         self.phi_R = nn.Sequential(
             nn.Linear(state_dim * 2 + edge_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, effect_dim),
         )
 
-        # φ_O: object model (per node) — now includes action
+        # φ_O: object model — includes action + accumulated effects
         self.phi_O = nn.Sequential(
             nn.Linear(state_dim + effect_dim + self.pos_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, self.pos_dim),  # outputs Δv
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.pos_dim),
         )
+
+        # For multi-pass: update edge features from updated node features
+        if n_message_passes > 1:
+            self.edge_update = nn.Sequential(
+                nn.Linear(effect_dim + state_dim * 2, hidden_dim),
+                nn.GELU(),
+                nn.Linear(hidden_dim, effect_dim),
+            )
 
     def compute_edge_attr(self, state: Tensor) -> tuple[Tensor, Tensor]:
         """Compute edge attributes from object states.
@@ -107,26 +121,31 @@ class InteractionNetwork(nn.Module):
         # 1. Compute edge attributes
         edge_attr, dist = self.compute_edge_attr(state)
 
-        # 2. φ_R: compute effects per edge
+        # 2. Multi-pass message passing
         s_i = state.unsqueeze(2).expand(B, K, K, S)
         s_j = state.unsqueeze(1).expand(B, K, K, S)
         phi_r_input = torch.cat([s_i, s_j, edge_attr], dim=-1)
         effects = self.phi_R(phi_r_input)  # (B, K, K, effect_dim)
 
-        # 3. Aggregate: sum incoming effects per node
+        for mp in range(self.n_message_passes - 1):
+            # Update edge features from current effects + node states
+            edge_update_input = torch.cat([effects, s_i, s_j], dim=-1)
+            effects = effects + self.edge_update(edge_update_input)
+
+        # 3. Aggregate effects per node
         agg = effects.sum(dim=2)  # (B, K, effect_dim)
 
         # 4. Action conditioning
         if action is not None:
-            action_force = self.action_proj(action)  # (B, K, D)
+            action_force = self.action_proj(action)
         else:
             action_force = torch.zeros(B, K, D, device=state.device)
 
-        # 5. φ_O: compute velocity update per node (state + aggregated effects + action)
+        # 5. φ_O: velocity update
         phi_o_input = torch.cat([state, agg, action_force], dim=-1)
-        delta_v = self.phi_O(phi_o_input)  # (B, K, D)
+        delta_v = self.phi_O(phi_o_input)
 
-        # 6. Semi-implicit Euler integration
+        # 6. Semi-implicit Euler
         v_new = v + delta_v
         q_new = q + self.dt * v_new
 
