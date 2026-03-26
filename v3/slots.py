@@ -10,6 +10,7 @@ then splits each slot into:
 import torch
 import torch.nn as nn
 from torch import Tensor
+from scipy.optimize import linear_sum_assignment
 
 
 class SlotAttention(nn.Module):
@@ -160,3 +161,60 @@ class SlotDecomposer(nn.Module):
         """
         dynamic_emb = self.dynamic_encoder(state)
         return torch.cat([static, dynamic_emb], dim=-1)
+
+
+def hungarian_match(
+    predicted_state: Tensor,
+    gt_state: Tensor,
+) -> Tensor:
+    """Match predicted slots to GT objects via Hungarian algorithm.
+
+    Solves the assignment problem: which predicted slot corresponds
+    to which GT object? Returns permutation indices.
+
+    Args:
+        predicted_state: (B, K_pred, D) predicted per-slot state
+        gt_state: (B, K_gt, D) ground-truth per-object state
+
+    Returns:
+        perm: (B, K_gt) indices into predicted slots for each GT object
+    """
+    B = predicted_state.shape[0]
+    K_gt = gt_state.shape[1]
+    perms = []
+
+    for b in range(B):
+        # Cost matrix: MSE between each predicted slot and each GT object
+        # (K_pred, K_gt)
+        cost = torch.cdist(
+            predicted_state[b].unsqueeze(0),
+            gt_state[b].unsqueeze(0),
+        ).squeeze(0)  # (K_pred, K_gt)
+
+        # Solve assignment
+        row_ind, col_ind = linear_sum_assignment(cost.detach().cpu().numpy())
+
+        # row_ind[i] is the predicted slot matched to GT object col_ind[i]
+        # We want: for each GT object j, which predicted slot?
+        perm = torch.zeros(K_gt, dtype=torch.long, device=predicted_state.device)
+        for r, c in zip(row_ind, col_ind):
+            if c < K_gt:
+                perm[c] = r
+        perms.append(perm)
+
+    return torch.stack(perms)  # (B, K_gt)
+
+
+def apply_permutation(tensor: Tensor, perm: Tensor) -> Tensor:
+    """Reorder slots according to permutation.
+
+    Args:
+        tensor: (B, K, ...) slot tensor
+        perm: (B, K_gt) permutation indices
+
+    Returns:
+        reordered: (B, K_gt, ...) matched to GT order
+    """
+    B, K_gt = perm.shape
+    batch_idx = torch.arange(B, device=tensor.device).unsqueeze(1).expand(B, K_gt)
+    return tensor[batch_idx, perm]

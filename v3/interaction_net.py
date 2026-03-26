@@ -33,6 +33,7 @@ class InteractionNetwork(nn.Module):
         self,
         state_dim: int = 4,     # (q_x, q_y, v_x, v_y)
         edge_dim: int = 5,      # (Δq_x, Δq_y, Δv_x, Δv_y, dist)
+        action_dim: int = 2,    # per-object action (Push-T: 2D force on agent)
         effect_dim: int = 32,
         hidden_dim: int = 64,
         dt: float = 5.0 / 60.0,
@@ -40,7 +41,15 @@ class InteractionNetwork(nn.Module):
         super().__init__()
         self.dt = dt
         self.state_dim = state_dim
-        self.pos_dim = state_dim // 2  # assume first half is q, second half is v
+        self.action_dim = action_dim
+        self.pos_dim = state_dim // 2
+
+        # Action projection: per-object action → force embedding
+        self.action_proj = nn.Sequential(
+            nn.Linear(action_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, self.pos_dim),  # action contributes to Δv
+        )
 
         # φ_R: relational model (per edge)
         self.phi_R = nn.Sequential(
@@ -49,11 +58,11 @@ class InteractionNetwork(nn.Module):
             nn.Linear(hidden_dim, effect_dim),
         )
 
-        # φ_O: object model (per node)
+        # φ_O: object model (per node) — now includes action
         self.phi_O = nn.Sequential(
-            nn.Linear(state_dim + effect_dim, hidden_dim),
+            nn.Linear(state_dim + effect_dim + self.pos_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, self.pos_dim),  # outputs Δv only
+            nn.Linear(hidden_dim, self.pos_dim),  # outputs Δv
         )
 
     def compute_edge_attr(self, state: Tensor) -> tuple[Tensor, Tensor]:
@@ -77,11 +86,13 @@ class InteractionNetwork(nn.Module):
         edge_attr = torch.cat([delta_q, delta_v, dist], dim=-1)  # (B, K, K, 2D+1)
         return edge_attr, dist.squeeze(-1)
 
-    def forward(self, state: Tensor) -> dict[str, Tensor]:
+    def forward(self, state: Tensor, action: Tensor | None = None) -> dict[str, Tensor]:
         """One step of Interaction Network dynamics.
 
         Args:
             state: (B, K, state_dim) current state [q, v]
+            action: (B, K, action_dim) per-object actions.
+                    For Push-T: agent gets the action, block/bg get zeros.
 
         Returns:
             next_state: (B, K, state_dim) predicted next state
@@ -105,11 +116,17 @@ class InteractionNetwork(nn.Module):
         # 3. Aggregate: sum incoming effects per node
         agg = effects.sum(dim=2)  # (B, K, effect_dim)
 
-        # 4. φ_O: compute velocity update per node
-        phi_o_input = torch.cat([state, agg], dim=-1)
+        # 4. Action conditioning
+        if action is not None:
+            action_force = self.action_proj(action)  # (B, K, D)
+        else:
+            action_force = torch.zeros(B, K, D, device=state.device)
+
+        # 5. φ_O: compute velocity update per node (state + aggregated effects + action)
+        phi_o_input = torch.cat([state, agg, action_force], dim=-1)
         delta_v = self.phi_O(phi_o_input)  # (B, K, D)
 
-        # 5. Semi-implicit Euler integration
+        # 6. Semi-implicit Euler integration
         v_new = v + delta_v
         q_new = q + self.dt * v_new
 
