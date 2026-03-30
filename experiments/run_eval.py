@@ -24,7 +24,9 @@ from einops import rearrange
 import argparse
 
 from v3.demiurge_v3 import DemiurgeV3
-from eval.suite.harness import EvalHarness
+# TODO: EvalHarness was removed (flawed perturbation approach).
+# Replace with pusht_ood-based evaluation when updating this script.
+# from eval.suite.harness import EvalHarness
 
 
 def extract_patches(lewm, pixels):

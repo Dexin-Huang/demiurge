@@ -47,6 +47,9 @@ venv/
 .DS_Store
 Thumbs.db
 
+# Inbox — ephemeral inter-agent messaging
+_inbox/
+
 # Experiment outputs
 experiments/ablations/*/results/
 experiments/ablations/*/checkpoints/

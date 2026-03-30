@@ -36,4 +36,4 @@ requires = ["setuptools>=68.0"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["layers*", "model*", "training*", "eval*"]
+include = ["v3*", "eval*"]
