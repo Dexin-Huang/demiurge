@@ -2,6 +2,9 @@
 # One-time pod setup for DEMIURGE
 # Run this on a fresh RunPod pod with the network volume attached.
 # After first run, data persists on /runpod-volume across pod recreations.
+#
+# Data sources: HuggingFace (https://huggingface.co/collections/quentinll/lewm)
+# No more Google Drive quota issues.
 set -e
 
 VOLUME=/runpod-volume
@@ -22,11 +25,12 @@ else
     cd $WORKSPACE && git checkout v0.2-hybrid-simulator
 fi
 
-# 2. Python environment (install into volume so it persists)
+# 2. Python environment
 if [ -d "$VENV" ]; then
     echo "Venv exists, activating..."
 else
     echo "Creating venv..."
+    pip install uv 2>/dev/null
     cd $WORKSPACE/baselines/lewm
     uv venv --python=3.10
 fi
@@ -37,7 +41,7 @@ python -c "import stable_worldmodel; import torch; print('Packages OK')" 2>/dev/
     echo "Installing packages..."
     uv pip install 'stable-worldmodel[train,env]'
     uv pip install 'torch==2.4.0+cu124' 'torchvision==0.19.0+cu124' --index-url https://download.pytorch.org/whl/cu124
-    uv pip install 'datasets>=2.18,<3.0' scipy scikit-learn
+    uv pip install 'datasets>=2.18,<3.0' scipy scikit-learn huggingface_hub
     # Fix torchvision transforms compatibility
     python3 -c "
 import re
@@ -49,51 +53,76 @@ print('Patched transforms')
 "
 }
 
-# 3. Data (on persistent volume)
+# 3. Data from HuggingFace (replaces Google Drive)
 mkdir -p $DATA_DIR $CKPT_DIR
 
-# LeWM pretrained checkpoint
+# LeWM pretrained checkpoint from HuggingFace
 if [ -f "$CKPT_DIR/lejepa_object.ckpt" ]; then
     echo "LeWM checkpoint exists"
 else
-    echo "Downloading LeWM checkpoint..."
-    cd $CKPT_DIR
-    gdown 1CagjbwPOovHlmcvot07eWvq7fGswdYtI -O lejepa.tar.zst
+    echo "Downloading LeWM checkpoint from HuggingFace..."
     python3 -c "
-import zstandard, tarfile, io
-with open('lejepa.tar.zst', 'rb') as f:
+from huggingface_hub import hf_hub_download
+import zstandard, tarfile, os
+
+# Download Push-T checkpoint from LeWM HF collection
+path = hf_hub_download(
+    repo_id='quentinll/lewm-pusht',
+    filename='ckpt/lejepa.tar.zst',
+    repo_type='dataset',
+)
+print(f'Downloaded: {path}')
+
+# Extract
+with open(path, 'rb') as f:
     dctx = zstandard.ZstdDecompressor()
     with dctx.stream_reader(f) as reader:
         with tarfile.open(fileobj=reader, mode='r|') as tar:
             tar.extractall('$CKPT_DIR/')
-print('Extracted')
+
+# Move to expected location
+for name in ['lejepa_object.ckpt', 'lejepa_weights.ckpt']:
+    src = os.path.join('$CKPT_DIR', 'pusht', name)
+    dst = os.path.join('$CKPT_DIR', name)
+    if os.path.exists(src):
+        os.rename(src, dst)
+
+# Cleanup
+import shutil
+pusht_dir = os.path.join('$CKPT_DIR', 'pusht')
+if os.path.isdir(pusht_dir):
+    shutil.rmtree(pusht_dir)
+print('Checkpoint ready')
 "
-    # Move checkpoint to expected location
-    mv $CKPT_DIR/pusht/lejepa_object.ckpt $CKPT_DIR/ 2>/dev/null || true
-    mv $CKPT_DIR/pusht/lejepa_weights.ckpt $CKPT_DIR/ 2>/dev/null || true
-    rm -f lejepa.tar.zst
-    rm -rf $CKPT_DIR/pusht
 fi
 
-# Push-T dataset
+# Push-T dataset from HuggingFace
 if [ -f "$DATA_DIR/pusht_expert_train.h5" ]; then
     echo "Push-T dataset exists"
 else
-    if [ -f "$VOLUME/pusht_expert_train.h5.zst" ]; then
-        echo "Decompressing dataset..."
-        python3 -c "
+    echo "Downloading Push-T dataset from HuggingFace..."
+    python3 -c "
+from huggingface_hub import hf_hub_download
 import zstandard, os
-with open('$VOLUME/pusht_expert_train.h5.zst', 'rb') as fin:
+
+# Download dataset
+path = hf_hub_download(
+    repo_id='quentinll/lewm-pusht',
+    filename='dataset/pusht_expert_train.h5.zst',
+    repo_type='dataset',
+)
+print(f'Downloaded: {path}')
+print('Decompressing (this takes a few minutes)...')
+
+# Decompress directly to volume
+with open(path, 'rb') as fin:
     dctx = zstandard.ZstdDecompressor()
     with open('$DATA_DIR/pusht_expert_train.h5', 'wb') as fout:
         dctx.copy_stream(fin, fout, read_size=8*1024*1024, write_size=8*1024*1024)
-print(f'Decompressed: {os.path.getsize(\"$DATA_DIR/pusht_expert_train.h5\")/1e9:.1f} GB')
+
+size = os.path.getsize('$DATA_DIR/pusht_expert_train.h5') / 1e9
+print(f'Dataset ready: {size:.1f} GB')
 "
-        rm -f $VOLUME/pusht_expert_train.h5.zst
-    else
-        echo "ERROR: Dataset not found. Upload pusht_expert_train.h5.zst to $VOLUME/"
-        echo "  scp -P <port> pusht_expert_train.h5.zst root@<ip>:$VOLUME/"
-    fi
 fi
 
 # Symlink for stable_worldmodel
@@ -114,4 +143,7 @@ ls -lh $DATA_DIR/pusht_expert_train.h5 2>/dev/null && echo "Dataset: OK" || echo
 
 echo ""
 echo "=== Setup Complete ==="
-echo "To train: source $VENV/bin/activate && PYTHONPATH=$WORKSPACE/baselines/lewm python $WORKSPACE/experiments/train_shield.py --checkpoint $CKPT_DIR/lejepa_object.ckpt --data_dir $DATA_DIR"
+echo "To train:"
+echo "  source $VENV/bin/activate"
+echo "  export PYTHONPATH=$WORKSPACE/baselines/lewm:\$PYTHONPATH"
+echo "  python $WORKSPACE/experiments/train_temporal.py --checkpoint $CKPT_DIR/lejepa_object.ckpt --data_dir $DATA_DIR"
