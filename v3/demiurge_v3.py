@@ -34,7 +34,7 @@ class DemiurgeV3(nn.Module):
         input_dim: int = 192,
         slot_dim: int = 128,
         static_dim: int = 64,
-        state_dim: int = 4,
+        state_dim: int = 6,      # (x, y, θ, vx, vy, ω)
         action_dim: int = 2,
         num_slots: int = 4,
         agent_slot: int = 0,       # which slot is the agent (for energy exclusion)

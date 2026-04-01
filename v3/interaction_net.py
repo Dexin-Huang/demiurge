@@ -31,7 +31,7 @@ class InteractionNetwork(nn.Module):
 
     def __init__(
         self,
-        state_dim: int = 4,
+        state_dim: int = 6,     # (x, y, θ, vx, vy, ω)
         edge_dim: int = 5,
         action_dim: int = 2,
         effect_dim: int = 128,    # scaled up from 32

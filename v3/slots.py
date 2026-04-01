@@ -134,7 +134,7 @@ class SlotDecomposer(nn.Module):
     Dynamic: physical state — (q_x, q_y, v_x, v_y). Changes with physics.
     """
 
-    def __init__(self, slot_dim: int = 128, static_dim: int = 64, state_dim: int = 4):
+    def __init__(self, slot_dim: int = 128, static_dim: int = 64, state_dim: int = 6):
         super().__init__()
         self.static_dim = static_dim
         self.state_dim = state_dim

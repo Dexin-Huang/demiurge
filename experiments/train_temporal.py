@@ -35,14 +35,27 @@ def extract_patches(lewm, pixels):
 
 
 def parse_gt_state(state):
-    """Push-T → (B, T, 2, 4): agent + block, each (q_x, q_y, v_x, v_y)."""
+    """Push-T → (B, T, 2, 6): agent + block, each (x, y, θ, vx, vy, ω)."""
     B, T, _ = state.shape
     dt = 5.0 / 60.0
-    gt = torch.zeros(B, T, 2, 4, device=state.device)
-    gt[:, :, 0, :2] = state[:, :, :2]
-    gt[:, :, 0, 2:] = state[:, :, 5:7]
-    gt[:, :, 1, :2] = state[:, :, 2:4]
-    gt[:, :-1, 1, 2:] = (state[:, 1:, 2:4] - state[:, :-1, 2:4]) / dt
+    gt = torch.zeros(B, T, 2, 6, device=state.device)
+
+    # Agent: (x, y, 0, vx, vy, 0) — no rotation for circle agent
+    gt[:, :, 0, :2] = state[:, :, :2]       # agent position
+    gt[:, :, 0, 3:5] = state[:, :, 5:7]     # agent velocity
+
+    # Block: (x, y, θ, vx, vy, ω)
+    gt[:, :, 1, :2] = state[:, :, 2:4]      # block position
+    gt[:, :, 1, 2] = state[:, :, 4]          # block angle
+    # Block linear velocity via finite difference
+    gt[:, :-1, 1, 3:5] = (state[:, 1:, 2:4] - state[:, :-1, 2:4]) / dt
+    # Block angular velocity via finite difference (with unwrapping)
+    dtheta = state[:, 1:, 4] - state[:, :-1, 4]
+    # Unwrap: if |dθ| > π, adjust
+    dtheta = dtheta - 2 * 3.14159 * (dtheta > 3.14159).float()
+    dtheta = dtheta + 2 * 3.14159 * (dtheta < -3.14159).float()
+    gt[:, :-1, 1, 5] = dtheta / dt
+
     return gt
 
 
@@ -105,7 +118,7 @@ def train(
     # Build model
     model = DemiurgeV3(
         input_dim=192, slot_dim=128, static_dim=64,
-        state_dim=4, action_dim=2, num_slots=4, agent_slot=0,
+        state_dim=6, action_dim=2, num_slots=4, agent_slot=0,
         dt=5.0 / 60.0,
         lambda_energy=0.1, lambda_newton=0.1, lambda_state=1.0,
     ).to(device)
@@ -245,9 +258,9 @@ def train(
             if vi >= 200:
                 break
 
-    est = torch.cat(est_all).reshape(-1, 4).numpy()
-    gt = torch.cat(gt_all).reshape(-1, 4).numpy()
-    for i, name in enumerate(["q_x", "q_y", "v_x", "v_y"]):
+    est = torch.cat(est_all).reshape(-1, 6).numpy()
+    gt = torch.cat(gt_all).reshape(-1, 6).numpy()
+    for i, name in enumerate(["x", "y", "θ", "vx", "vy", "ω"]):
         r, _ = pearsonr(est[:, i], gt[:, i])
         print(f"  {name}: r={r:.3f}")
 
