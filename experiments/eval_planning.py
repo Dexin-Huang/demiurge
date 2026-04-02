@@ -64,7 +64,7 @@ def evaluate_planner(
     horizon = planner.horizon
 
     for ep, (start, goal) in enumerate(zip(start_states, goal_states)):
-        env_unwrapped = env.envs[0].unwrapped
+        env_unwrapped = env.envs.envs[0].unwrapped
 
         # Reset and apply physics
         env.envs.reset()
