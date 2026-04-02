@@ -2,3 +2,4 @@ from .slots import SlotAttention, SlotDecomposer, hungarian_match, apply_permuta
 from .interaction_net import InteractionNetwork
 from .demiurge_v3 import DemiurgeV3
 from .shield import SafetyShield
+from .planner import StructuredPlanner
