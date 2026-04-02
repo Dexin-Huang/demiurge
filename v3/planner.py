@@ -85,12 +85,11 @@ class StructuredPlanner:
         Uses position + angle (first pos_dim dims).
         """
         final_state = predicted_states[-1]  # (S, K, state_dim)
-        pos_dim = self.model.state_dim // 2
         b = self.block_slot
 
-        # Block pose: position + angle
-        pred_block = final_state[:, b, :pos_dim]       # (S, pos_dim)
-        goal_block = goal_state[0, b, :pos_dim]         # (pos_dim,)
+        # Block position only (x, y) — NOT theta, which is index 2
+        pred_block = final_state[:, b, :2]       # (S, 2)
+        goal_block = goal_state[0, b, :2]         # (2,)
 
         cost = (pred_block - goal_block.unsqueeze(0)).pow(2).sum(dim=-1)  # (S,)
         return cost

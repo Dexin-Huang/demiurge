@@ -48,66 +48,73 @@ def evaluate_planner(
     action_block=5,
     eval_budget=50,
     label="Structured",
+    physics_fn=None,
 ):
-    """Run closed-loop planning evaluation.
+    """Run closed-loop receding-horizon planning evaluation.
 
     For each (start, goal) pair:
         1. Reset env to start state
-        2. Plan action sequence toward goal
-        3. Execute action_block steps
+        2. Apply physics_fn if provided (for OOD tests)
+        3. Plan-execute-replan loop until budget exhausted
         4. Measure final block pose distance to goal
 
     Returns list of final distances (lower = better).
     """
     distances = []
+    horizon = planner.horizon
 
     for ep, (start, goal) in enumerate(zip(start_states, goal_states)):
         env_unwrapped = env.envs[0].unwrapped
 
-        # Reset to start state
-        env.reset()
+        # Reset and apply physics
+        env.envs.reset()
         try:
             env_unwrapped._set_state(state=start)
         except Exception:
-            continue
-
-        # Get current and goal frames
-        current_frame = preprocess_frame(env_unwrapped.render(), device)
-
-        # Set goal state temporarily to render goal
-        saved_state = env_unwrapped._get_obs()
-        try:
-            env_unwrapped._set_state(state=goal)
-            goal_frame = preprocess_frame(env_unwrapped.render(), device)
-            env_unwrapped._set_state(state=saved_state)
-        except Exception:
-            goal_frame = current_frame  # fallback
-
-        # Plan
-        agent_pos = torch.tensor(start[:2], device=device, dtype=torch.float32)
-        try:
-            actions = planner.plan(current_frame, goal_frame, agent_pos=agent_pos)
-        except Exception as e:
-            if (ep + 1) <= 3:
-                print(f"  {label} plan failed ep {ep}: {e}")
             distances.append(float('inf'))
             continue
 
-        # Execute action_block steps
-        for t in range(min(action_block, actions.shape[0])):
-            action = actions[t].cpu().numpy()
-            # Push-T expects (num_envs, action_dim)
-            action_env = action.reshape(1, -1)
+        if physics_fn is not None:
+            physics_fn(env_unwrapped)
+
+        # Render goal frame once
+        saved = env_unwrapped._get_obs()
+        try:
+            env_unwrapped._set_state(state=goal)
+            goal_frame = preprocess_frame(env_unwrapped.render(), device)
+            env_unwrapped._set_state(state=saved)
+        except Exception:
+            distances.append(float('inf'))
+            continue
+
+        # Receding-horizon: plan → execute action_block → replan
+        steps_taken = 0
+        while steps_taken < eval_budget:
+            current_frame = preprocess_frame(env_unwrapped.render(), device)
+            current_state = env_unwrapped._get_obs()
+            agent_pos = torch.tensor(current_state[:2], device=device, dtype=torch.float32)
+
             try:
-                env.step(action_env)
-            except Exception:
+                actions = planner.plan(current_frame, goal_frame, agent_pos=agent_pos)
+            except Exception as e:
+                if ep < 3:
+                    print(f"  {label} plan failed ep {ep} step {steps_taken}: {e}")
                 break
 
-        # Measure final block pose distance to goal
+            # Execute action_block steps
+            for t in range(min(action_block, actions.shape[0])):
+                action = actions[t].cpu().numpy().reshape(1, -1)
+                try:
+                    env.envs.step(action)
+                except Exception:
+                    break
+                steps_taken += 1
+                if steps_taken >= eval_budget:
+                    break
+
+        # Measure final distance
         final_state = env_unwrapped._get_obs()
-        block_pos = final_state[2:4]
-        goal_block_pos = goal[2:4]
-        dist = np.sqrt(((block_pos - goal_block_pos) ** 2).sum())
+        dist = np.sqrt(((final_state[2:4] - goal[2:4]) ** 2).sum())
         distances.append(dist)
 
         if (ep + 1) % 10 == 0:
@@ -184,23 +191,23 @@ def run(
         planner, world, start_states, goal_states, device, label="Structured",
     )
 
-    # Random baseline
+    # Random baseline — same start states, same step budget
     random_dists = []
     for ep in range(n_episodes):
-        env = world.envs.envs[0].unwrapped
+        env_uw = world.envs.envs[0].unwrapped
         world.envs.reset()
         try:
-            env._set_state(state=start_states[ep])
+            env_uw._set_state(state=start_states[ep])
         except Exception:
             random_dists.append(float('inf'))
             continue
         for _ in range(5):
             action = rng.uniform(-1, 1, size=(1, 2)).astype(np.float32)
             try:
-                world.step(action)
+                world.envs.step(action)
             except Exception:
                 break
-        final = env._get_obs()
+        final = env_uw._get_obs()
         dist = np.sqrt(((final[2:4] - goal_states[ep][2:4]) ** 2).sum())
         random_dists.append(dist)
 
@@ -221,43 +228,41 @@ def run(
     print("Test 2: Heavy Block (mass 5x)")
     print("=" * 60)
 
-    # Modify physics
-    env = world.envs.envs[0].unwrapped
-    original_mass = env.block.mass
+    env_unwrapped = world.envs.envs[0].unwrapped
+    original_mass = env_unwrapped.block.mass
 
-    def set_heavy():
-        env.block.mass = original_mass * 5
+    def make_heavy(env_uw):
+        """Apply AFTER each reset — physics must be set post-reset."""
+        env_uw.block.mass = original_mass * 5
 
-    def reset_physics():
-        env.block.mass = original_mass
-
-    set_heavy()
     structured_ood = evaluate_planner(
         planner, world, start_states[:20], goal_states[:20], device,
-        label="Structured-OOD",
+        label="Structured-OOD", physics_fn=make_heavy,
     )
 
-    reset_physics()
-    set_heavy()
+    # Random OOD baseline
     random_ood = []
     for ep in range(20):
         world.envs.reset()
+        env_unwrapped = world.envs.envs[0].unwrapped
         try:
-            env._set_state(state=start_states[ep])
+            env_unwrapped._set_state(state=start_states[ep])
         except Exception:
             random_ood.append(float('inf'))
             continue
+        make_heavy(env_unwrapped)
         for _ in range(5):
             action = rng.uniform(-1, 1, size=(1, 2)).astype(np.float32)
             try:
-                world.step(action)
+                world.envs.step(action)
             except Exception:
                 break
-        final = env._get_obs()
+        final = env_unwrapped._get_obs()
         dist = np.sqrt(((final[2:4] - goal_states[ep][2:4]) ** 2).sum())
         random_ood.append(dist)
 
-    reset_physics()
+    # Reset physics for cleanup
+    env_unwrapped.block.mass = original_mass
 
     print()
     so = [d for d in structured_ood if d < float('inf')]
